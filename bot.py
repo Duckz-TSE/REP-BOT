@@ -8,7 +8,7 @@ Commands (slash):
   /leaderboard               -> top-repped members in the server
 
 Rules:
-  - Unlimited votes per person
+  - Up to 2 +rep AND 2 -rep per voter, per target, per rolling 24 hours
   - Free-text comment required on every vote
   - You cannot rep yourself
   - Voter + comment are public
@@ -30,6 +30,10 @@ from discord import app_commands
 
 DB_PATH = "reps.db"
 
+# How many of each type one person can give the same member within the window.
+VOTE_LIMIT = 2
+WINDOW_HOURS = 24
+
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -42,7 +46,7 @@ def init_db():
             voter_id  TEXT NOT NULL,   -- person giving the rep
             value     INTEGER NOT NULL,-- +1 or -1
             comment   TEXT NOT NULL,
-            created   TEXT NOT NULL    -- ISO timestamp
+            created   TEXT NOT NULL    -- ISO timestamp (UTC)
         )
         """
     )
@@ -66,6 +70,27 @@ def add_rep(guild_id, target_id, voter_id, value, comment):
     )
     conn.commit()
     conn.close()
+
+
+def recent_votes_of_type(guild_id, target_id, voter_id, value):
+    """
+    Timestamps of this voter's votes of one type (+1 or -1) on this target
+    within the last WINDOW_HOURS. Returns a list of datetime objects, oldest
+    first — len() is how many they've used, [0] is the one that frees up next.
+    """
+    cutoff = (
+        datetime.datetime.utcnow() - datetime.timedelta(hours=WINDOW_HOURS)
+    ).isoformat()
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.execute(
+        "SELECT created FROM reps "
+        "WHERE guild_id = ? AND target_id = ? AND voter_id = ? "
+        "AND value = ? AND created >= ? ORDER BY created ASC",
+        (str(guild_id), str(target_id), str(voter_id), value, cutoff),
+    )
+    rows = [datetime.datetime.fromisoformat(r[0]) for r in cur.fetchall()]
+    conn.close()
+    return rows
 
 
 def get_totals(guild_id, target_id):
@@ -113,6 +138,17 @@ def get_leaderboard(guild_id, limit=10):
     return rows
 
 
+def _fmt_remaining(td):
+    """Turn a timedelta into a short 'Xh Ym' string."""
+    total_min = max(0, int(td.total_seconds() // 60))
+    h, m = divmod(total_min, 60)
+    if h and m:
+        return f"{h}h {m}m"
+    if h:
+        return f"{h}h"
+    return f"{m}m"
+
+
 # ---------------------------------------------------------------------------
 # Bot setup
 # ---------------------------------------------------------------------------
@@ -145,19 +181,34 @@ async def _do_vote(interaction: discord.Interaction, member: discord.Member,
         )
         return
 
+    # rate limit: max VOTE_LIMIT of THIS type in the rolling window
+    used = recent_votes_of_type(interaction.guild_id, member.id,
+                                interaction.user.id, value)
+    if len(used) >= VOTE_LIMIT:
+        kind = "+rep" if value == 1 else "-rep"
+        frees_at = used[0] + datetime.timedelta(hours=WINDOW_HOURS)
+        remaining = frees_at - datetime.datetime.utcnow()
+        await interaction.response.send_message(
+            f"You've already given {member.display_name} {VOTE_LIMIT} "
+            f"{kind}s in the last {WINDOW_HOURS}h. "
+            f"Try again in **{_fmt_remaining(remaining)}**.",
+            ephemeral=True,
+        )
+        return
+
     add_rep(interaction.guild_id, member.id, interaction.user.id, value, comment)
     pos, neg, net = get_totals(interaction.guild_id, member.id)
 
     if value == 1:
-        title = f"➕ +rep for {member.display_name}"
+        title = f"\u2795 +rep for {member.display_name}"
         color = discord.Color.green()
     else:
-        title = f"➖ -rep for {member.display_name}"
+        title = f"\u2796 -rep for {member.display_name}"
         color = discord.Color.red()
 
     embed = discord.Embed(title=title, description=f'"{comment}"', color=color)
     embed.add_field(name="From", value=interaction.user.mention, inline=True)
-    embed.add_field(name="Net score", value=f"**{net}**  ({pos}↑ / {neg}↓)",
+    embed.add_field(name="Net score", value=f"**{net}**  ({pos}\u2191 / {neg}\u2193)",
                     inline=True)
     await interaction.response.send_message(embed=embed)
 
@@ -187,17 +238,17 @@ async def profile(interaction: discord.Interaction,
     recent = get_recent(interaction.guild_id, member.id, limit=5)
 
     embed = discord.Embed(
-        title=f"📊 {member.display_name}'s rep",
+        title=f"\U0001F4CA {member.display_name}'s rep",
         color=discord.Color.blurple(),
     )
     embed.add_field(name="Net score", value=f"**{net}**", inline=True)
-    embed.add_field(name="👍 Positive", value=str(pos), inline=True)
-    embed.add_field(name="👎 Negative", value=str(neg), inline=True)
+    embed.add_field(name="\U0001F44D Positive", value=str(pos), inline=True)
+    embed.add_field(name="\U0001F44E Negative", value=str(neg), inline=True)
 
     if recent:
         lines = []
         for value, voter_id, comment, created in recent:
-            sign = "➕" if value == 1 else "➖"
+            sign = "\u2795" if value == 1 else "\u2796"
             lines.append(f'{sign} <@{voter_id}>: "{comment}"')
         embed.add_field(name="Recent", value="\n".join(lines), inline=False)
     else:
@@ -214,14 +265,14 @@ async def leaderboard(interaction: discord.Interaction):
         await interaction.response.send_message("No reps yet in this server.")
         return
 
-    medals = ["🥇", "🥈", "🥉"]
+    medals = ["\U0001F947", "\U0001F948", "\U0001F949"]
     lines = []
     for i, (target_id, net, pos, neg) in enumerate(rows):
         prefix = medals[i] if i < 3 else f"`#{i + 1}`"
-        lines.append(f"{prefix} <@{target_id}> — **{net}** ({pos}↑ / {neg}↓)")
+        lines.append(f"{prefix} <@{target_id}> \u2014 **{net}** ({pos}\u2191 / {neg}\u2193)")
 
     embed = discord.Embed(
-        title="🏆 Rep Leaderboard",
+        title="\U0001F3C6 Rep Leaderboard",
         description="\n".join(lines),
         color=discord.Color.gold(),
     )
@@ -229,18 +280,15 @@ async def leaderboard(interaction: discord.Interaction):
 
 
 # ---------------------------------------------------------------------------
-# HOW TO RUN
+# HOW TO RUN  (you've already done this — kept here for reference)
 # ---------------------------------------------------------------------------
 # 1. Make a bot: https://discord.com/developers/applications
 #       -> New Application -> Bot tab -> Reset/Copy the TOKEN.
-# 2. In that same Bot tab, no special intents are needed (this bot only uses
-#    default intents + slash commands).
+# 2. Leave all Privileged Gateway Intents OFF (this bot doesn't need them).
 # 3. Invite it: OAuth2 -> URL Generator -> scopes: "bot" + "applications.commands"
-#       -> bot permissions: "Send Messages". Open the generated URL, pick your server.
-# 4. Set your token as an environment variable named DISCORD_TOKEN
-#    (on Replit/Railway use their Secrets tab — do NOT paste it in the code).
-# 5. Run this file.  First launch registers the slash commands (can take a
-#    minute to appear in Discord).
+#       -> bot permissions: "Send Messages". Open the URL, pick your server.
+# 4. Set your token as env var DISCORD_TOKEN (Railway: Variables tab).
+# 5. Start command:  python bot.py
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
