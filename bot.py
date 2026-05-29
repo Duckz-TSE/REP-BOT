@@ -38,7 +38,7 @@ DB_PATH = "reps.db"
 
 VOTE_LIMIT = 2          # max of each type per voter/target/role per window
 WINDOW_HOURS = 24
-MIN_POS = 5             # need at least this many +reps to earn a role
+MIN_POS = 3             # need at least this many +reps to earn a role
 RATIO = 2               # +reps must be >= RATIO * -reps to hold the role
 
 
